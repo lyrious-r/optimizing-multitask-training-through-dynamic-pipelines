@@ -235,12 +235,24 @@ class InstructionOptimizer:
                 )
         return new_instrs, len(buffer_slots)
 
+    def _add_rcpolicy(self, instrs: List[PipeInstruction]):
+        for instr_idx, instr in enumerate(instrs):
+            if isinstance(
+                instr,
+                (
+                    ForwardPass,
+                ),
+            ):
+                recompute_policy = (0,self.n_stages,'full')
+                instr.recompute_policy.append(recompute_policy)
+
     def optimize(self):
         result_instrs = []
         result_num_buffers = []
         for instrs in self.per_worker_instructions:
             instrs = self._inject_comm_finish_instrs(instrs)
             instrs, num_buffers = self._allocate_buffers(instrs)
+            instrs = self._add_rcpolicy(instrs)
             # check all needed buffers are allocated
             for instr in instrs:
                 if isinstance(

@@ -362,7 +362,41 @@ class RecvGradFinish(CommunicationFinishInsturction):
 class ForwardPass(BufferInstruction):
     """Execute the forward pass."""
 
-    pass
+    def __init__(
+        self,
+        microbatch,
+        stage,
+        buffer_ids: Optional[List[int]] = None,
+        buffer_shapes: List[Tuple[int, ...]] = None,
+        recompute_policy: List[Tuple[int, int, str]] = None,
+        **kwargs,
+    ):
+        super().__init__(
+            microbatch,
+            stage,
+            buffer_ids,
+            buffer_shapes,
+            recompute_policy=recompute_policy,
+            **kwargs,
+        )
+        self.recompute_policy: List[Tuple[int, int, str]]
+
+    def serialize(self, config=SerializationConfig()) -> bytes:
+        return super().serialize(config=config) + int(
+            self.recompute_policy
+        ).to_bytes(config.EXECUTION_PLAN_META_BYTES, config.BYTES_ENDIANNESS)
+
+    @classmethod
+    def _deserialize(
+        cls, bytes, config=SerializationConfig()
+    ) -> Tuple[Dict[str, Any], bytes]:
+        kwargs, bytes = super()._deserialize(bytes, config=config)
+        recompute_policy = int.from_bytes(
+            bytes[: config.EXECUTION_PLAN_META_BYTES], config.BYTES_ENDIANNESS
+        )
+        bytes = bytes[config.EXECUTION_PLAN_META_BYTES :]
+        kwargs.update({"recompute_policy": List[Tuple[int, int, str]](recompute_policy)})
+        return kwargs, bytes
 
 
 class BackwardPass(BufferInstruction):
