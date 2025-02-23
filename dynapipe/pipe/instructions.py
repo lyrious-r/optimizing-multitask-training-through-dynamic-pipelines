@@ -368,7 +368,7 @@ class ForwardPass(BufferInstruction):
         stage,
         buffer_ids: Optional[List[int]] = None,
         buffer_shapes: List[Tuple[int, ...]] = None,
-        recompute_policy: List[Tuple[int, int, str]] = None,
+        recompute_policy: List[Tuple[int, int, int]] = None,
         **kwargs,
     ):
         super().__init__(
@@ -379,23 +379,58 @@ class ForwardPass(BufferInstruction):
             recompute_policy=recompute_policy,
             **kwargs,
         )
-        self.recompute_policy: List[Tuple[int, int, str]]
+        self.recompute_policy: List[Tuple[int, int, int]]
 
     def serialize(self, config=SerializationConfig()) -> bytes:
-        return super().serialize(config=config) + int(
-            self.recompute_policy
-        ).to_bytes(config.EXECUTION_PLAN_META_BYTES, config.BYTES_ENDIANNESS)
+        def tuple_to_bytes(
+            data: Tuple[int, int, int], 
+            meta_bytes: int, 
+            endianness: str
+        ) -> bytes:
+            return b''.join(
+                [x.to_bytes(meta_bytes, endianness) for x in data]
+            )
+        
+        serialized_recompute_policy = [
+            tuple_to_bytes(policy, config.EXECUTION_PLAN_META_BYTES, config.BYTES_ENDIANNESS)
+            for policy in self.recompute_policy
+        ]
+        return (
+            super().serialize(config=config)
+            + len(self.recompute_policy).to_bytes(config.EXECUTION_PLAN_META_BYTES, config.BYTES_ENDIANNESS)
+            + b"".join(serialized_recompute_policy)
+        )
 
     @classmethod
     def _deserialize(
-        cls, bytes, config=SerializationConfig()
+        cls, bytes: bytes, config=SerializationConfig()
     ) -> Tuple[Dict[str, Any], bytes]:
+        
+        def deserialize_tuple_of_ints(
+            bytes: bytes, 
+            meta_bytes: int, 
+            endianness: str
+        ) -> Tuple[int, int, int]:
+            # Deserialize each of the 3 integers from the byte stream
+            return tuple(
+                int.from_bytes(bytes[i * meta_bytes: (i + 1) * meta_bytes], endianness)
+                for i in range(3)
+            )
+        
         kwargs, bytes = super()._deserialize(bytes, config=config)
-        recompute_policy = int.from_bytes(
-            bytes[: config.EXECUTION_PLAN_META_BYTES], config.BYTES_ENDIANNESS
+
+        n_recompute_policy = int.from_bytes(
+            bytes[:config.EXECUTION_PLAN_META_BYTES],
+            config.BYTES_ENDIANNESS,
         )
         bytes = bytes[config.EXECUTION_PLAN_META_BYTES :]
-        kwargs.update({"recompute_policy": List[Tuple[int, int, str]](recompute_policy)})
+        recompute_policy = []
+        for _ in range(n_recompute_policy):
+            policy = deserialize_tuple_of_ints(bytes, config.EXECUTION_PLAN_META_BYTES, config.BYTES_ENDIANNESS)
+            recompute_policy.append(policy)
+            bytes = bytes[len(policy) * config.EXECUTION_PLAN_META_BYTES :]
+        
+        kwargs.update({"recompute_policy": recompute_policy})
         return kwargs, bytes
 
 

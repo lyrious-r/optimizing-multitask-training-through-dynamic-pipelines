@@ -236,15 +236,16 @@ class InstructionOptimizer:
         return new_instrs, len(buffer_slots)
 
     def _add_rcpolicy(self, instrs: List[PipeInstruction]):
-        for instr_idx, instr in enumerate(instrs):
+        for idx, instr in enumerate(instrs):
             if isinstance(
                 instr,
                 (
                     ForwardPass,
                 ),
             ):
-                recompute_policy = (0,self.n_stages,'full')
-                instr.recompute_policy.append(recompute_policy)
+                instr.recompute_policy = [(i,i+1,1) for i in range(self.n_stages)]
+
+        return instrs
 
     def optimize(self):
         result_instrs = []
