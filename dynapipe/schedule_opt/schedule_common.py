@@ -84,6 +84,7 @@ class SchedulerMicrobatchSpec:
         activation_shapes: List[List[Tuple[int, int, int]]],
         bw_times: List[int],
         bw_comm_times: List[int],
+        rc_plan: Optional[List[Tuple[int, int, int]]] = None,
     ):
         self.name = name
         self._fw_times = fw_times
@@ -108,6 +109,7 @@ class SchedulerMicrobatchSpec:
             "_bw_comm_times",
         ]
         self._initialized = False
+        self._rc_plan = rc_plan
         self._validate_spec()
 
     def _validate_spec(self):
@@ -186,6 +188,29 @@ class SchedulerMicrobatchSpec:
             setattr(self, attr, merged_attrs[attr])
         self.n_orig_layers = len(merged2orig)
         self._layers_merged = True
+
+        # 处理rc_plan的合并
+        if self._rc_plan is not None:
+            new_rc_plan = []
+            
+            for merged_layer_id in sorted(merged2orig.keys()):
+                orig_layers = merged2orig[merged_layer_id]
+                merged_layer_rc_plans = []
+                
+                # 对于合并层中的每个原始层位置(0-3)
+                for local_idx, orig_layer_idx in enumerate(orig_layers):
+                    # 找到对应原始层的rc_plan\
+                    try:
+                        orig_rc_plan = self._rc_plan[orig_layer_idx]  # 形如(layer_idx, layer_idx+1, rc_type)
+                    except:
+                        print(self._rc_plan)
+                        raise ValueError("rc_plan is not set for layer {}".format(orig_layer_idx))
+                    # 在合并后层内使用local_idx
+                    merged_layer_rc_plans.append((local_idx, local_idx + 1, orig_rc_plan[2]))
+                
+                new_rc_plan.append(merged_layer_rc_plans)
+            print(new_rc_plan)
+            self._rc_plan = new_rc_plan
 
     def _flatten(self):
         # Flattening concatenates the backward pass to the forward ones
@@ -393,15 +418,17 @@ class ScheduleOperation:
     tensor_shape: Tuple[Tuple[int, int, int]]
     loads_data: Tuple[Tuple[int, int, int], ...] = tuple()
     next_executor: Optional["ScheduleExecutor"] = None
+    rc_plan: Optional[List[Tuple[int, int, int]]] = field(default=None, compare=True, hash=False)
 
     def __repr__(self) -> str:
         return (
-            "(name={}, m{}, fst{}, fw={}, shape={}, next_executor: {})".format(
+            "(name={}, m{}, fst{}, fw={}, shape={}, rc={}, next_executor: {})".format(
                 self.name,
                 self.microbatch,
                 self.flattened_stage,
                 self.is_forward,
                 self.tensor_shape,
+                [rc[2] for rc in self.rc_plan] if self.rc_plan else None,
                 self.next_executor.executor_id if self.next_executor else None,
             )
         )
@@ -577,6 +604,7 @@ class ScheduleExecutor:
                     op.flattened_stage, self.n_orig_layers
                 ),
                 buffer_shapes=list(op.tensor_shape),
+                recompute_policy=op.rc_plan if op.rc_plan else None,
             )
         else:
             instruction = BackwardPass(
@@ -833,6 +861,21 @@ class Scheduler:
             # first layer, needs load data
             loads_data = tensor_shape
 
+        is_forward = _is_fw_stage(flattened_stage_id, self.n_orig_layers)
+        stage_rc_plan = None
+        
+        # 只有前向计算阶段需要添加rc_plan
+        if is_forward and not _is_comm_stage(flattened_stage_id, self.n_orig_layers):
+            # 获取原始layer_id(未flatten)
+            orig_layer_id = _get_comp_only_stage_index(flattened_stage_id, self.n_orig_layers)
+            
+            # 找到对应的merged_layer_id
+            for merged_layer_id, orig_layers in self.minibatch_spec.merged2original.items():
+                if orig_layer_id in orig_layers:
+                    # 获取这个microbatch在这个merged_layer的完整rc_plan
+                    stage_rc_plan = self.minibatch_spec.microbatches[microbatch_id]._rc_plan[merged_layer_id]
+                    break
+
         return ScheduleOperation(
             name=self.minibatch_spec.microbatches[microbatch_id].name,
             microbatch=microbatch_id,
@@ -840,7 +883,7 @@ class Scheduler:
             exec_time=self.minibatch_spec.microbatches[
                 microbatch_id
             ].flattened_exec_times[flattened_stage_id],
-            is_forward=_is_fw_stage(flattened_stage_id, self.n_orig_layers),
+            is_forward=is_forward,
             stored_memory=self.minibatch_spec.microbatches[
                 microbatch_id
             ].flattened_stored_activation_sizes[flattened_stage_id],
@@ -853,6 +896,7 @@ class Scheduler:
             tensor_shape=tensor_shape,
             loads_data=tuple(loads_data),
             next_executor=self._get_next_executor(flattened_stage_id),
+            rc_plan=stage_rc_plan,  # 添加整个stage的rc_plan列表
         )
 
     def _get_metadata(self):

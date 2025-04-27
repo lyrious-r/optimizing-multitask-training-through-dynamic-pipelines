@@ -641,29 +641,51 @@ class ProfileBasedCostModelWithRC(object):
     def get_cost(
         self,
         tp_size,
+        stage,
+        seq_len,
+        mbs,
+    ):
+        """获取所有重计算类型的计算成本。
+        
+        Returns:
+            List[float]: 包含三种重计算类型的执行时间 [none_time, full_time, selective_time]
+        """
+        costs = []
+        for rc_type in ["none", "full", "selective"]:
+            self._check_valid_cm_key((tp_size, rc_type))
+            costs.append(self.cost_models[(tp_size, rc_type)].get_cost(
+                stage, seq_len, mbs
+            ))
+        return costs
+
+    def get_stored_activation(
+        self,
+        tp_size,
+        stage,
+        seq_len,
+        mbs,
+    ):
+        """获取所有重计算类型的存储激活内存。
+        
+        Returns:
+            List[float]: 包含三种重计算类型的存储激活内存 [none_mem, full_mem, selective_mem]
+        """
+        memories = []
+        for rc_type in ["none", "full", "selective"]:
+            self._check_valid_cm_key((tp_size, rc_type))
+            memories.append(self.cost_models[(tp_size, rc_type)].get_stored_activation(
+                stage, seq_len, mbs
+            ))
+        return memories
+
+    def get_peak_activation(
+        self,
+        tp_size,
         rc_type,
         stage,
         seq_len,
         mbs,
     ):
-        """Select the corresponding cost model based on TP degree and
-        recomputation type and get the computation cost.
-        """
-        self._check_valid_cm_key((tp_size, rc_type))
-        return self.cost_models[(tp_size, rc_type)].get_cost(
-            stage, seq_len, mbs
-        )
-
-    def get_stored_activation(self, tp_size, rc_type, stage, seq_len, mbs):
-        """Select the corresponding cost model based on TP degree and
-        recomputation type and get the stored activation.
-        """
-        self._check_valid_cm_key((tp_size, rc_type))
-        return self.cost_models[(tp_size, rc_type)].get_stored_activation(
-            stage, seq_len, mbs
-        )
-
-    def get_peak_activation(self, tp_size, rc_type, stage, seq_len, mbs):
         """Select the corresponding cost model based on TP degree and
         recomputation type and get the peak activation.
         """

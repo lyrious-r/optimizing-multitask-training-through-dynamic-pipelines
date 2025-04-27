@@ -3,7 +3,7 @@
 
 import json
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Tuple, Union, Optional
 
 from dynapipe.schedule_opt import get_scheduler_class
 from dynapipe.schedule_opt.schedule_common import (
@@ -79,15 +79,16 @@ class DynaPipeMicrobatch:
     # arguments to the micro-batch generator and scheduler.
     def __init__(self, name) -> None:
         self.name = name
-        # in DynaPipeModel, "layer" refers to an actual layer in the model
         self.n_layers = None
-        self.fw_exec_times = []
-        self.bw_exec_times = []
+        # 执行时间和存储激活需要三种重计算方案
+        self.fw_exec_times = [[], [], []]  # [none_times, full_times, selective_times]
+        self.bw_exec_times = [[], [], []]
+        self.model_stored_activation_memory = [[], [], []]
+        # 这些不需要区分重计算方案
         self.fw_comm_size = []
         self.bw_comm_size = []
         self.model_state_memory = []
-        self.model_stored_activation_memory = []
-        self.model_peak_activation_memory = []
+        self.model_peak_activation_memory = []  # 保持单列表
         self.activation_shapes = []
 
     def _check_or_set_nlayers(self, n_layers, debug_name, minus_one=False):
@@ -105,15 +106,21 @@ class DynaPipeMicrobatch:
         else:
             self.n_layers = n_layers
 
-    def set_fw_exec_times(self, fw_exec_times: List[float]) -> None:
-        # time is in us (microseconds)
-        self._check_or_set_nlayers(len(fw_exec_times), "fw_exec_times")
-        self.fw_exec_times = fw_exec_times
+    def set_fw_exec_times(self, fw_exec_times_list: List[List[float]]) -> None:
+        assert len(fw_exec_times_list) == 3, "Must provide times for all 3 recompute types"
+        n_layers = len(fw_exec_times_list[0])
+        for times in fw_exec_times_list[1:]:
+            assert len(times) == n_layers, "Inconsistent layer numbers across recompute types"
+        self._check_or_set_nlayers(n_layers, "fw_exec_times")
+        self.fw_exec_times = fw_exec_times_list
 
-    def set_bw_exec_times(self, bw_exec_times: List[float]) -> None:
-        # time is in us (microseconds)
-        self._check_or_set_nlayers(len(bw_exec_times), "bw_exec_times")
-        self.bw_exec_times = bw_exec_times
+    def set_bw_exec_times(self, bw_exec_times_list: List[List[float]]) -> None:
+        assert len(bw_exec_times_list) == 3, "Must provide times for all 3 recompute types"
+        n_layers = len(bw_exec_times_list[0])
+        for times in bw_exec_times_list[1:]:
+            assert len(times) == n_layers, "Inconsistent layer numbers across recompute types"
+        self._check_or_set_nlayers(n_layers, "bw_exec_times")
+        self.bw_exec_times = bw_exec_times_list
 
     def set_fw_comm_size(self, fw_comm_size: List[float]) -> None:
         # size is in mega bytes (MB)
@@ -135,16 +142,16 @@ class DynaPipeMicrobatch:
             len(model_state_memory), "model_state_memory"
         )
         self.model_state_memory = model_state_memory
-
+        
     def set_model_stored_activation_memory(
-        self, model_stored_activation_memory: List[float]
+        self, stored_activation_list: List[List[float]]
     ) -> None:
-        # size is in MB (megabytes)
-        self._check_or_set_nlayers(
-            len(model_stored_activation_memory),
-            "model_stored_activation_memory",
-        )
-        self.model_stored_activation_memory = model_stored_activation_memory
+        assert len(stored_activation_list) == 3, "Must provide memory for all 3 recompute types"
+        n_layers = len(stored_activation_list[0])
+        for mem in stored_activation_list[1:]:
+            assert len(mem) == n_layers, "Inconsistent layer numbers across recompute types"
+        self._check_or_set_nlayers(n_layers, "model_stored_activation_memory")
+        self.model_stored_activation_memory = stored_activation_list
 
     def set_model_peak_activation_memory(
         self, model_peak_activation_memory: List[float]
@@ -169,12 +176,12 @@ class DynaPipeMicrobatch:
 
     def check_all_set(self):
         assert self.n_layers is not None
-        assert len(self.fw_exec_times) == self.n_layers
-        assert len(self.bw_exec_times) == self.n_layers
+        assert len(self.fw_exec_times[0]) == self.n_layers
+        assert len(self.bw_exec_times[0]) == self.n_layers
         assert len(self.fw_comm_size) == self.n_layers - 1
         assert len(self.bw_comm_size) == self.n_layers - 1
         assert len(self.model_state_memory) == self.n_layers
-        assert len(self.model_stored_activation_memory) == self.n_layers
+        assert len(self.model_stored_activation_memory[0]) == self.n_layers
         assert len(self.model_peak_activation_memory) == self.n_layers
         assert len(self.activation_shapes) == self.n_layers
 
@@ -366,13 +373,13 @@ def get_uniform_microbatch(
 ):
     comm_size = comm_size * comm_ratio
     microbatch = DynaPipeMicrobatch("uniform")
-    microbatch.set_fw_exec_times([comp_time] * n_layers)
-    microbatch.set_bw_exec_times([comp_time * bw_multiplier] * n_layers)
+    microbatch.set_fw_exec_times([[comp_time] * n_layers] * 3)
+    microbatch.set_bw_exec_times([[comp_time * bw_multiplier] * n_layers] * 3)
     microbatch.set_fw_comm_size([comm_size] * (n_layers - 1))
     microbatch.set_bw_comm_size([comm_size * bw_multiplier] * (n_layers - 1))
     microbatch.set_model_state_memory([per_layer_state_memory] * n_layers)
     microbatch.set_model_stored_activation_memory(
-        [per_layer_stored_activation_memory] * n_layers
+        [[per_layer_stored_activation_memory] * n_layers] * 3
     )
     microbatch.set_model_peak_activation_memory(
         [per_layer_peak_activation_memory] * n_layers
@@ -405,10 +412,10 @@ def get_example_ende_microbatch(
     en_comm_size = en_comm_size * comm_ratio
     microbatch = DynaPipeMicrobatch("ende")
     microbatch.set_fw_exec_times(
-        [en_comp_time] * n_layers_en + [en_comp_time * de_ratio] * n_layers_de
+        [[en_comp_time] * n_layers_en + [en_comp_time * de_ratio] * n_layers_de] * 3
     )
     microbatch.set_bw_exec_times(
-        [bw_multiplier * x for x in list(reversed(microbatch.fw_exec_times))]
+        [[bw_multiplier * x for x in list(reversed(microbatch.fw_exec_times[0]))]] * 3
     )
     microbatch.set_fw_comm_size(
         [en_comm_size] * n_layers_en + [en_comm_size * 2] * (n_layers_de - 1)
@@ -419,8 +426,7 @@ def get_example_ende_microbatch(
         + [en_per_layer_state_memory * de_ratio] * n_layers_de
     )
     microbatch.set_model_stored_activation_memory(
-        [per_layer_stored_activation_memory] * n_layers_en
-        + [per_layer_stored_activation_memory * de_ratio] * n_layers_de
+        [[per_layer_stored_activation_memory] * n_layers_en + [per_layer_stored_activation_memory * de_ratio] * n_layers_de] * 3
     )
     microbatch.set_model_peak_activation_memory(
         [per_layer_peak_activation_memory] * n_layers_en
@@ -444,6 +450,7 @@ def get_simulator(
     dpp_minibatch: DynaPipeMinibatch,
     dpp_cluster: DynaPipeCluster,
     device_assignment: List[int],
+    rc_plan: Optional[List[List[Tuple[int, int, int]]]] = None,
     include_memory_stats: bool = True,
     memory_limit: float = float("inf"),
     max_otf_microbatches: Union[None, int] = None,
@@ -457,8 +464,32 @@ def get_simulator(
     )
     bw_device_assignment = list(reversed(device_assignment))
     microbatch_specs = []
-    for microbatch in dpp_minibatch.microbatches:
-        fw_times = microbatch.fw_exec_times
+    for mb_idx, microbatch in enumerate(dpp_minibatch.microbatches):
+        if rc_plan is not None:
+            print('*********mb_rc_plan: ', rc_plan[mb_idx])
+            mb_rc_plan = rc_plan[mb_idx]
+            fw_times = []
+            bw_times = []
+            stored_activation = []
+            
+            for layer_idx in range(microbatch.n_layers):
+                rc_type = 0  # 默认使用 none
+                for start, end, rc in mb_rc_plan:
+                    if start <= layer_idx < end:
+                        rc_type = rc
+                        break
+                        
+                fw_times.append(microbatch.fw_exec_times[rc_type][layer_idx])
+                bw_times.append(microbatch.bw_exec_times[rc_type][layer_idx])
+                stored_activation.append(microbatch.model_stored_activation_memory[rc_type][layer_idx])
+        else:
+            raise NotImplementedError("no rc_plan is not supported for now")
+            # 默认使用 none (rc_type=0)
+            fw_times = microbatch.fw_exec_times[0]
+            bw_times = microbatch.bw_exec_times[0]
+            stored_activation = microbatch.model_stored_activation_memory[0]
+            mb_rc_plan = None
+
         fw_comm_times = [
             dpp_cluster.get_comm_time(
                 microbatch.fw_comm_size[i],
@@ -467,7 +498,6 @@ def get_simulator(
             )
             for i in range(microbatch.n_layers - 1)
         ]
-        bw_times = microbatch.bw_exec_times
         bw_comm_times = [
             dpp_cluster.get_comm_time(
                 microbatch.bw_comm_size[i],
@@ -477,17 +507,17 @@ def get_simulator(
             for i in range(microbatch.n_layers - 1)
         ]
         fw_model_state = microbatch.model_state_memory
-        fw_stored_activation = microbatch.model_stored_activation_memory
         fw_peak_activation = microbatch.model_peak_activation_memory
         microbatch_spec = SchedulerMicrobatchSpec(
             name=microbatch.name,
             fw_times=fw_times,
             fw_comm_times=fw_comm_times,
-            fw_stored_activation_size=fw_stored_activation,
+            fw_stored_activation_size=stored_activation,
             fw_peak_activation_size=fw_peak_activation,
             bw_times=bw_times,
             bw_comm_times=bw_comm_times,
             activation_shapes=microbatch.activation_shapes,
+            rc_plan=mb_rc_plan,
         )
         microbatch_specs.append(microbatch_spec)
     minibatch_spec = SchedulerMinibatchSpec(

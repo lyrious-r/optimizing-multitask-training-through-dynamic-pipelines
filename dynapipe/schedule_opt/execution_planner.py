@@ -41,7 +41,7 @@ def optimize_schedule(
     disable_scheduler_memory_limit=False,
     max_otf_microbatches=None,
     raise_on_oom=True,
-    rc_type: Optional[str] = None,
+    rc_type: Optional[str] = None, # NOT USED
     logger: Optional[logging.Logger] = None,
 ):
     if try_permutations:
@@ -119,36 +119,98 @@ def optimize_schedule(
             iterator = permutations
         debug_json = None
         mem_for_perms = []
+
+        def adjust_rc_plan(current_plan, stage_memories, memory_limit):
+            """根据每个stage的内存使用调整重计算策略
+            
+            Args:
+                current_plan: List[List[Tuple[int, int, int]]] 当前的重计算策略,每个microbatch一个列表
+                stage_memories: Dict[int, float] 每个stage的峰值内存使用
+                memory_limit: float 内存限制
+            
+            Returns:
+                List[List[Tuple[int, int, int]]] 新的重计算策略
+            """
+            new_plan = []
+            # 将字符串按空格分割
+            # "Executor 0 Compute" -> ["Executor", "0", "Compute"]
+
+            compute_memories = {}
+
+            for full_name, memory in stage_memories.items():
+                # 只处理Compute执行器
+                if "Compute" in full_name:
+                    # 提取executor_id
+                    executor_id = int(full_name.split()[1])
+                    compute_memories[executor_id] = memory
+            
+            for mb_plan in current_plan:
+                new_mb_plan = []
+                for start, end, rc_type in mb_plan:
+                    if compute_memories[device_assignment[start]] > memory_limit:
+                        if rc_type == 0:
+                            new_mb_plan.append((start, end, 2))
+                        elif rc_type == 2:
+                            new_mb_plan.append((start, end, 1))
+                        else:
+                            new_mb_plan.append((start, end, rc_type))
+                    else:
+                        new_mb_plan.append((start, end, rc_type))
+                new_plan.append(new_mb_plan)
+
+
+            return new_plan
+
+
         for perm in iterator:
             permuted_minibatch = opt_minibatch.permute_microbatches(perm)
-            # get simulator
-            simulator = get_simulator(
-                sch_type,
-                permuted_minibatch,
-                opt_cluster,
-                device_assignment,
-                include_memory_stats=include_memory_stats,
-                memory_limit=scheduler_memory_limit,
-                max_otf_microbatches=max_otf_microbatches,
-                logger=logger,
-            )
-            timeline_json = simulator.schedule()
-            instructions = simulator.get_instructions()
-            peak_memory = simulator.get_executor_peak_memory()
-            max_memory_device = -1
-            max_device_memory = -1
-            for device, memory in peak_memory.items():
-                if memory > max_device_memory:
-                    max_memory_device = device
-                    max_device_memory = memory
-            makespan = simulator.get_makespan()
-            if makespan is None:
-                continue
-            makespan = makespan / 1000.0
-            debug_json = timeline_json
-            mem_for_perms.append(max_device_memory)
-            if max_device_memory > memory_limit:
-                continue
+            n_stages = len(permuted_minibatch.microbatches[0].fw_exec_times[0])  # 获取总stage数
+            rc_plan = [[(i, i+1, 0) for i in range(n_stages)] for _ in range(len(permuted_minibatch.microbatches))]  # [(start_stage, end_stage, rc_type)] 0表示none
+            opnum = 0
+            while True:
+                opnum += 1
+                if opnum > 100:
+                    raise RuntimeError("too many iterations")
+                # get simulator
+                simulator = get_simulator(
+                    sch_type,
+                    permuted_minibatch,
+                    opt_cluster,
+                    device_assignment,
+                    rc_plan=rc_plan,
+                    include_memory_stats=include_memory_stats,
+                    memory_limit=scheduler_memory_limit,
+                    max_otf_microbatches=max_otf_microbatches,
+                    logger=logger,
+                )
+                timeline_json = simulator.schedule()
+                instructions = simulator.get_instructions()
+                peak_memory = simulator.get_executor_peak_memory()
+                max_memory_device = -1
+                max_device_memory = -1
+                for device, memory in peak_memory.items():
+                    if memory > max_device_memory:
+                        max_memory_device = device
+                        max_device_memory = memory
+                makespan = simulator.get_makespan()
+                if makespan is None:
+                    continue
+                makespan = makespan / 1000.0
+                debug_json = timeline_json
+                mem_for_perms.append(max_device_memory)
+                # 检查内存和时间约束
+                if max_device_memory > memory_limit:
+                    # 分析每个stage的内存使用情况,修改rc_plan
+                    stage_memories = simulator.get_executor_peak_memory()
+                    new_rc_plan = adjust_rc_plan(rc_plan, stage_memories, memory_limit)
+                    print("new plan generated")
+                    if new_rc_plan == rc_plan:  # 如果无法进一步优化
+                        break
+                    rc_plan = new_rc_plan
+                    continue
+
+                break
+
             if makespan > max_makespan:
                 max_makespan = makespan
                 max_stats = (
@@ -158,6 +220,7 @@ def optimize_schedule(
                     timeline_json,
                 )
                 max_instructions = instructions
+            
             if makespan < min_makespan:
                 min_makespan = makespan
                 min_stats = (
@@ -167,12 +230,13 @@ def optimize_schedule(
                     timeline_json,
                 )
                 min_instructions = instructions
+
+                
         if logger is not None and max_makespan > 0.0:
             logger.debug(
-                "Sched mem limit: {}, RC type: {}, Schedule type: {}, "
+                "Sched mem limit: {}, Schedule type: {}, "
                 "min peak memory: {} MB, makespan: {}.".format(
                     scheduler_memory_limit,
-                    rc_type,
                     sch_type,
                     min(mem_for_perms),
                     min_makespan,
@@ -245,19 +309,14 @@ def construct_minibatch_spec(
     model_spec: TransformerModelSpec,
     cost_model: ProfileBasedCostModelWithRC,
     minibatch: List[Tuple[int, int, int]],
-    rc_type: str,
     dp_size: int = 1,
     tp_size: int = 1,
     zero_stage: int = 0,
     minibatch_idx: Optional[int] = None,
     name="microbatch",
 ):
-    # use cost model to get the execution time and memory consumption
-    # of each stage
     microbatches = []
-    for microbatch_idx, (mbsize, input_seqlen, target_seqlen) in enumerate(
-        minibatch
-    ):
+    for microbatch_idx, (mbsize, input_seqlen, target_seqlen) in enumerate(minibatch):
         # sanity check
         if model_spec.n_decoder_layers == 0 and target_seqlen != 0:
             raise ValueError(
@@ -275,7 +334,6 @@ def construct_minibatch_spec(
             return (
                 cost_model.get_cost(
                     tp_size,
-                    rc_type,
                     stage_name,
                     seqlen,
                     mbsize,
@@ -286,7 +344,6 @@ def construct_minibatch_spec(
         def _get_stored_activation(stage_name, seqlen):
             return cost_model.get_stored_activation(
                 tp_size,
-                rc_type,
                 stage_name,
                 seqlen,
                 mbsize,
@@ -295,67 +352,90 @@ def construct_minibatch_spec(
         def _get_peak_activation(stage_name, seqlen):
             return cost_model.get_peak_activation(
                 tp_size,
-                rc_type,
+                "none",  # 使用默认的none类型
                 stage_name,
                 seqlen,
                 mbsize,
             )
 
-        # every cost needs to time * 1000 since get_cost returns time
-        # in milliseconds and we need to convert it to microseconds
-        # the costs are for each single actual transformer layer in the model
-        enc_fw_time = _get_cost("Encoder FW", input_seqlen)
-        enc_bw_time = _get_cost("Encoder BW", input_seqlen)
-        enc_postprocess_fw_time = 0
-        enc_postprocess_bw_time = 0
-        dec_postprocess_fw_time = 0
-        dec_postprocess_bw_time = 0
+        # 获取执行时间和存储激活内存
+        enc_fw_times = _get_cost("Encoder FW", input_seqlen)
+        enc_bw_times = _get_cost("Encoder BW", input_seqlen)
+        enc_stored_activation = _get_stored_activation("Encoder", input_seqlen)
+
+        # 后处理时间
         if target_seqlen > 0:
-            dec_fw_time = _get_cost(
-                "Decoder FW", (input_seqlen, target_seqlen)
-            )
-            dec_bw_time = _get_cost(
-                "Decoder BW", (input_seqlen, target_seqlen)
-            )
-            dec_postprocess_fw_time = _get_cost(
-                "Postprocess FW", target_seqlen
-            )
-            dec_postprocess_bw_time = _get_cost(
-                "Postprocess BW", target_seqlen
-            )
+            dec_fw_times = _get_cost("Decoder FW", (input_seqlen, target_seqlen))
+            dec_bw_times = _get_cost("Decoder BW", (input_seqlen, target_seqlen))
+            dec_stored_activation = _get_stored_activation("Decoder", (input_seqlen, target_seqlen))
+            dec_postprocess_fw_times = _get_cost("Postprocess FW", target_seqlen)
+            dec_postprocess_bw_times = _get_cost("Postprocess BW", target_seqlen)
+            enc_postprocess_fw_times = [0, 0, 0]
+            enc_postprocess_bw_times = [0, 0, 0]
         else:
-            dec_fw_time = 0
-            dec_bw_time = 0
-            enc_postprocess_fw_time = _get_cost("Postprocess FW", input_seqlen)
-            enc_postprocess_bw_time = _get_cost("Postprocess BW", input_seqlen)
-        enc_stored_activation_memory = _get_stored_activation(
-            "Encoder", input_seqlen
-        )
-        if target_seqlen > 0:
-            dec_stored_activation_memory = _get_stored_activation(
-                "Decoder", (input_seqlen, target_seqlen)
-            )
-        else:
-            dec_stored_activation_memory = 0
-        enc_peak_activation_memory = _get_peak_activation(
-            "Encoder", input_seqlen
-        )
+            dec_fw_times = [0, 0, 0]
+            dec_bw_times = [0, 0, 0]
+            dec_stored_activation = [0, 0, 0]
+            dec_postprocess_fw_times = [0, 0, 0]
+            dec_postprocess_bw_times = [0, 0, 0]
+            enc_postprocess_fw_times = _get_cost("Postprocess FW", input_seqlen)
+            enc_postprocess_bw_times = _get_cost("Postprocess BW", input_seqlen)
+
+        # 为每种重计算类型构建执行时间列表
+        fw_times_list = []
+        bw_times_list = []
+        stored_activation_list = []
+
+        for rc_idx in range(3):  # 0=none, 1=full, 2=selective
+            fw_times = ([enc_fw_times[rc_idx]] * (model_spec.n_encoder_layers - 1) +
+                       [enc_fw_times[rc_idx] + enc_postprocess_fw_times[rc_idx]] +
+                       [dec_fw_times[rc_idx]] * max(0, model_spec.n_decoder_layers - 1) +
+                       ([dec_fw_times[rc_idx] + dec_postprocess_fw_times[rc_idx]]
+                        if target_seqlen > 0 else []))
+            fw_times_list.append(fw_times)
+            
+            bw_times = ([dec_bw_times[rc_idx] + dec_postprocess_bw_times[rc_idx]]
+                       if target_seqlen > 0 else []) + \
+                      [dec_bw_times[rc_idx]] * max(0, model_spec.n_decoder_layers - 1) + \
+                      [enc_bw_times[rc_idx] + enc_postprocess_bw_times[rc_idx]] + \
+                      [enc_bw_times[rc_idx]] * (model_spec.n_encoder_layers - 1)
+            bw_times_list.append(bw_times)
+            
+            stored_activation = [enc_stored_activation[rc_idx]] * model_spec.n_encoder_layers + \
+                              [dec_stored_activation[rc_idx]] * model_spec.n_decoder_layers
+            stored_activation_list.append(stored_activation)
+
+        # 设置执行时间和存储激活内存
+        mb.set_fw_exec_times(fw_times_list)
+        mb.set_bw_exec_times(bw_times_list)
+        mb.set_model_stored_activation_memory(stored_activation_list)
+
+        # 获取峰值激活内存（不区分重计算类型）
+        enc_peak_activation_memory = _get_peak_activation("Encoder", input_seqlen)
         if target_seqlen > 0:
             dec_peak_activation_memory = _get_peak_activation(
                 "Decoder", (input_seqlen, target_seqlen)
             )
         else:
             dec_peak_activation_memory = 0
+
+        # 设置其他不受重计算影响的属性
+        mb.set_model_peak_activation_memory(
+            [enc_peak_activation_memory] * model_spec.n_encoder_layers +
+            [dec_peak_activation_memory] * model_spec.n_decoder_layers
+        )
+
+        # 设置通信大小和模型状态内存（使用默认的none类型）
         emb_model_state_memory = cost_model.get_model_state(
             tp_size,
-            rc_type,
+            "none",
             "Embedding",
             n_shards=dp_size,
             zero_stage=zero_stage,
         )
         enc_model_state_memory = cost_model.get_model_state(
             tp_size,
-            rc_type,
+            "none",
             "Encoder",
             n_shards=dp_size,
             zero_stage=zero_stage,
@@ -363,13 +443,14 @@ def construct_minibatch_spec(
         if target_seqlen > 0:
             dec_model_state_memory = cost_model.get_model_state(
                 tp_size,
-                rc_type,
+                "none",
                 "Decoder",
                 n_shards=dp_size,
                 zero_stage=zero_stage,
             )
         else:
             dec_model_state_memory = 0
+
         enc_model_output_memory = get_transformer_output_memory(
             input_seqlen, mbsize, model_spec.hidden_dim, bytes_per_element=2
         )
@@ -422,27 +503,7 @@ def construct_minibatch_spec(
                 # invalid cost, return None
                 return None
 
-        # populate execution time statistics for microbatch
-        mb.set_fw_exec_times(
-            [enc_fw_time] * (model_spec.n_encoder_layers - 1)
-            + [enc_fw_time + enc_postprocess_fw_time]
-            + [dec_fw_time] * max(0, model_spec.n_decoder_layers - 1)
-            + (
-                [dec_fw_time + dec_postprocess_fw_time]
-                if target_seqlen > 0
-                else []
-            )
-        )
-        mb.set_bw_exec_times(
-            (
-                [dec_bw_time + dec_postprocess_bw_time]
-                if target_seqlen > 0
-                else []
-            )
-            + [dec_bw_time] * max(0, model_spec.n_decoder_layers - 1)
-            + [enc_bw_time + enc_postprocess_bw_time]
-            + [enc_bw_time] * (model_spec.n_encoder_layers - 1)
-        )
+
         mb.set_fw_comm_size(
             [enc_model_output_memory]
             * (model_spec.n_encoder_layers - (1 if target_seqlen == 0 else 0))
@@ -454,15 +515,8 @@ def construct_minibatch_spec(
             * model_spec.n_decoder_layers
             + [enc_model_output_memory] * (model_spec.n_encoder_layers - 1)
         )
-        mb.set_model_stored_activation_memory(
-            [enc_stored_activation_memory] * model_spec.n_encoder_layers
-            + [dec_stored_activation_memory] * model_spec.n_decoder_layers
-        )
-        mb.set_model_peak_activation_memory(
-            [enc_peak_activation_memory] * model_spec.n_encoder_layers
-            + [dec_peak_activation_memory] * model_spec.n_decoder_layers
-        )
-        # first layer of encoder and decoder also have embedding model state
+
+        # 设置模型状态内存
         mb.set_model_state_memory(
             [emb_model_state_memory + enc_model_state_memory]
             + [enc_model_state_memory] * (model_spec.n_encoder_layers - 1)
@@ -474,7 +528,8 @@ def construct_minibatch_spec(
             + [dec_model_state_memory]
             * max(0, model_spec.n_decoder_layers - 1)
         )
-        # shapes should be a tuple of tuples
+
+        # 设置激活形状
         mb.set_activation_shapes(
             [[(mbsize, input_seqlen, model_spec.hidden_dim)]]
             * model_spec.n_encoder_layers
@@ -486,8 +541,11 @@ def construct_minibatch_spec(
             ]
             * model_spec.n_decoder_layers
         )
+
+        # 检查所有属性是否设置完成
         mb.check_all_set()
         microbatches.append(mb)
+
     minibatch_spec = DynaPipeMinibatch(name, microbatches)
     return minibatch_spec
 
@@ -530,6 +588,7 @@ class ExecutionPlanner:
         schedule_method="dynamic",
         rc_type=None,
     ):
+        # 保持原有的 rc_type 处理逻辑
         if rc_type is not None:
             if not isinstance(rc_type, list):
                 available_rc_types = [rc_type]
@@ -537,12 +596,10 @@ class ExecutionPlanner:
                 available_rc_types = rc_type
         else:
             available_rc_types = ["none", "selective", "full"]
+
+        # 处理调度方法
         if schedule_method == "dynamic":
             sch_methods = self.valid_schedule_methods
-            spec_args = []
-            for rc_type in available_rc_types:
-                for sch in sch_methods:
-                    spec_args.append((sch, rc_type))
         else:
             if schedule_method not in self.valid_schedule_methods:
                 raise ValueError(
@@ -551,22 +608,22 @@ class ExecutionPlanner:
                         schedule_method, self.device_assignment
                     )
                 )
-            spec_args = [
-                (schedule_method, rc_type) for rc_type in available_rc_types
-            ]
+            sch_methods = [schedule_method]
+
+        # 生成候选项
         candidates = []
-        for schedule_method, rc_type in spec_args:
-            minibatch_spec = construct_minibatch_spec(
-                self.model_spec,
-                self.cost_model,
-                batch,
-                rc_type,
-                dp_size=self.dp_size,
-                tp_size=self.tp_size,
-                zero_stage=self.zero_stage,
-            )
-            if minibatch_spec is not None:
-                candidates.append((schedule_method, rc_type, minibatch_spec))
+        # 只调用一次 construct_minibatch_spec
+        minibatch_spec = construct_minibatch_spec(
+            self.model_spec,
+            self.cost_model,
+            batch,
+            dp_size=self.dp_size,
+            tp_size=self.tp_size,
+            zero_stage=self.zero_stage,
+        )
+        if minibatch_spec is not None:
+            for sch in sch_methods:
+                candidates.append((sch, minibatch_spec))
         return candidates
 
     def _optimize_instructions(
@@ -604,7 +661,7 @@ class ExecutionPlanner:
         best_rc = None
         best_cost = None
         best_stats = None
-        for schedule_method, rc_type, minibatch_spec in candidates:
+        for schedule_method, minibatch_spec in candidates:
             (
                 max_makespan,
                 _,
