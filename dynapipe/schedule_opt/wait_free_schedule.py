@@ -51,6 +51,7 @@ class WaitFreeScheduler(Scheduler):
             memory_limit,
             logger=logger,
         )
+
         self._initialize()
         self._pending_events: PriorityQueue[CompleteEvent] = PriorityQueue()
         self.executors: Dict[ExecutorIndex, WaitFreeExecutor]

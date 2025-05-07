@@ -466,7 +466,6 @@ def get_simulator(
     microbatch_specs = []
     for mb_idx, microbatch in enumerate(dpp_minibatch.microbatches):
         if rc_plan is not None:
-            print('*********mb_rc_plan: ', rc_plan[mb_idx])
             mb_rc_plan = rc_plan[mb_idx]
             fw_times = []
             bw_times = []

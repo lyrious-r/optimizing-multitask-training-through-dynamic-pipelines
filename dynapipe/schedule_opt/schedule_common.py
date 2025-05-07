@@ -209,7 +209,6 @@ class SchedulerMicrobatchSpec:
                     merged_layer_rc_plans.append((local_idx, local_idx + 1, orig_rc_plan[2]))
                 
                 new_rc_plan.append(merged_layer_rc_plans)
-            print(new_rc_plan)
             self._rc_plan = new_rc_plan
 
     def _flatten(self):
@@ -254,7 +253,6 @@ class SchedulerMicrobatchSpec:
         self.flattened_activation_shapes = (
             self._activation_shapes + backward_activation_shapes
         )
-
         self._flattened_attrs = [
             "flattened_stored_activation_sizes",
             "flattened_peak_activation_sizes",
@@ -296,8 +294,9 @@ class SchedulerMicrobatchSpec:
             setattr(self, attr, flat_attrs_w_comm[attr])
 
     def initialize(self):
-        self._flatten()
-        self._initialized = True
+        if not self._initialized:
+            self._flatten()
+            self._initialized = True
 
     def is_layers_merged(self):
         return self._layers_merged
@@ -354,6 +353,7 @@ class SchedulerMinibatchSpec:
         # call merge layers on each microbatch
         for microbatch in self.microbatches:
             microbatch._merge_layers(merged2orig)
+            print("microbatch._rc_plan: ", [i[0][2] for i in microbatch._rc_plan])
         self._layers_merged = True
 
     def _flatten(self):
@@ -398,11 +398,12 @@ class SchedulerMinibatchSpec:
         self.n_flattened_stages = 4 * self.n_orig_layers - 2
 
     def initialize(self):
-        self._merge_layers()
-        self._flatten()
-        for microbatch in self.microbatches:
-            microbatch.initialize()
-        self._initialized = True
+        if not self._initialized:
+            self._merge_layers()
+            self._flatten()
+            for microbatch in self.microbatches:
+                microbatch.initialize()
+            self._initialized = True
 
 
 @dataclass(frozen=True, eq=True)
@@ -931,3 +932,72 @@ class Scheduler:
             if executor.parent_executor is None
         ]
         return instructions
+
+def analyze_backward_pass_redundancy(trace_events, rc_plan=None, device_assignment=None):
+    """
+    返回值为 {executor_id: [ {"microbatch": int, "redundancy": float}, ... ] }，每组按冗余量降序。
+    只统计 rc_type != 1 的 microbatch, executor 对。
+    需要传入 rc_plan 和 device_assignment。
+    executor_id 会通过 device_assignment 转换为其对应的第一个 layer 的 id。
+    """
+    from collections import defaultdict
+    import re
+    compute_events = defaultdict(list)
+    for event in trace_events["traceEvents"]:
+        if event.get("ph") != "X":
+            continue
+        name = event["name"]
+        # 识别BackwardPass: 以B结尾且不含Comm
+        if re.match(r".*B$", name) and "Comm" not in name:
+            key = (event["pid"], event["tid"])
+            compute_events[key].append(event)
+        # 识别ForwardPass: 纯数字
+        elif re.match(r"^\d+$", name):
+            key = (event["pid"], event["tid"])
+            compute_events[key].append(event)
+    # 2. 对每个executor内事件按开始时间排序
+    for events in compute_events.values():
+        events.sort(key=lambda e: e["ts"])
+    # 3. 计算每个BackwardPass的冗余量，按executor_id分组
+    result = defaultdict(list)
+    for key, events in compute_events.items():
+        executor_id = key[0]
+        backward_indices = [i for i, e in enumerate(events) if re.match(r".*B$", e["name"])]
+        for idx, i in enumerate(backward_indices):
+            if idx == len(backward_indices) - 1:
+                continue  # 最后一个BackwardPass不计入冗余
+            event = events[i]
+            end_time = event["ts"] + event["dur"]
+            next_start = None
+            for j in range(i+1, len(events)):
+                if re.match(r"^\d+$", events[j]["name"]) or re.match(r".*B$", events[j]["name"]):
+                    next_start = events[j]["ts"]
+                    break
+            if next_start is None:
+                continue
+            wait_time = next_start - end_time
+            redundancy = wait_time / event["dur"] if wait_time > 1e-6 else 0.0
+            # 提取microbatch id（数字部分）
+            m = re.match(r"(\d+)B$", event["name"])
+            microbatch_id = int(m.group(1)) if m else -1
+            # 新增：只统计 rc_type != 1 的 microbatch, executor 对
+            if rc_plan is not None and device_assignment is not None and microbatch_id >= 0:
+                # executor_id -> 该executor负责的第一个layer的id
+                try:
+                    first_layer_id = device_assignment.index(executor_id)
+                except ValueError:
+                    first_layer_id = executor_id  # fallback
+                try:
+                    rc_type = rc_plan[microbatch_id][first_layer_id][2]
+                except Exception:
+                    rc_type = None
+                if rc_type == 1:
+                    continue  # 跳过 full recompute
+            result[executor_id].append({
+                "microbatch": microbatch_id,
+                "redundancy": redundancy
+            })
+    # 4. 每组按冗余量降序排序
+    for executor_id in result:
+        result[executor_id].sort(key=lambda x: x["redundancy"], reverse=True)
+    return dict(result)

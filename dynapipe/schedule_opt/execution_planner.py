@@ -25,7 +25,7 @@ from dynapipe.pipe.instructions import (
 )
 from dynapipe.pipe.utils import validate_device_assignment
 from dynapipe.utils.memory_utils import get_transformer_output_memory
-
+from dynapipe.schedule_opt.schedule_common import analyze_backward_pass_redundancy
 
 def optimize_schedule(
     sch_type: str,
@@ -120,57 +120,70 @@ def optimize_schedule(
         debug_json = None
         mem_for_perms = []
 
-        def adjust_rc_plan(current_plan, stage_memories, memory_limit):
-            """根据每个stage的内存使用调整重计算策略
-            
-            Args:
-                current_plan: List[List[Tuple[int, int, int]]] 当前的重计算策略,每个microbatch一个列表
-                stage_memories: Dict[int, float] 每个stage的峰值内存使用
-                memory_limit: float 内存限制
-            
-            Returns:
-                List[List[Tuple[int, int, int]]] 新的重计算策略
+        def adjust_rc_plan(rc_plan, peak_memory, trace_events, memory_limit, topk=1):
             """
-            new_plan = []
-            # 将字符串按空格分割
-            # "Executor 0 Compute" -> ["Executor", "0", "Compute"]
-
-            compute_memories = {}
-
-            for full_name, memory in stage_memories.items():
-                # 只处理Compute执行器
-                if "Compute" in full_name:
-                    # 提取executor_id
-                    executor_id = int(full_name.split()[1])
-                    compute_memories[executor_id] = memory
-            
-            for mb_plan in current_plan:
+            只对 peak_memory 超过 memory_limit 的 compute executor, 调整其冗余最多的 topk 个 microbatch 的 rc_type。
+            - 如果 redundancy > 1, new_rc_type 直接设为 1。
+            - rc_type == 1 的 microbatch 不参与冗余分析和调整。
+            - 冗余分析结果为空时不做任何调整。
+            其它不变。
+            """
+            import re
+            # 1. 找出超限的 compute executor id
+            over_limit_executors = set()
+            for full_name, mem in peak_memory.items():
+                if "Compute" in full_name and mem > memory_limit:
+                    m = re.search(r"Executor (\d+)", full_name)
+                    if m:
+                        executor_id = int(m.group(1))
+                        over_limit_executors.add(executor_id)
+            # 2. 冗余分析
+            redundancy = analyze_backward_pass_redundancy(trace_events,rc_plan,device_assignment)
+            # 3. 记录需要调整的 (microbatch, executor) -> new_rc_type
+            to_adjust = dict()  # (mb, executor) -> new_rc_type
+            for executor_id, items in redundancy.items():
+                if executor_id not in over_limit_executors:
+                    continue
+                count = 0
+                for item in items:
+                    if count >= topk:
+                        break
+                    # 跳过 rc_type==1 的 microbatch（后面判断）
+                    # 冗余大于1直接设为1，否则按原逻辑
+                    if item["redundancy"] >= 0.5:
+                        to_adjust[(item["microbatch"], executor_id)] = 1
+                    else:
+                        to_adjust[(item["microbatch"], executor_id)] = 2
+                    count += 1
+            # 4. 遍历rc_plan，调整对应microbatch在该executor的rc_type
+            new_rc_plan = []
+            for mb_idx, mb_plan in enumerate(rc_plan):
                 new_mb_plan = []
-                for start, end, rc_type in mb_plan:
-                    if compute_memories[device_assignment[start]] > memory_limit:
+                for layer_idx, (start, end, rc_type) in enumerate(mb_plan):
+                    executor_id = device_assignment[layer_idx]
+                    # rc_type==1 的不参与冗余调整
+                    if rc_type == 1:
+                        new_mb_plan.append((start, end, rc_type))
+                        continue
+                    key = (mb_idx, executor_id)
+                    if key in to_adjust:
                         if rc_type == 0:
-                            new_mb_plan.append((start, end, 2))
-                        elif rc_type == 2:
-                            new_mb_plan.append((start, end, 1))
+                            new_rc_type = to_adjust[key]
                         else:
-                            new_mb_plan.append((start, end, rc_type))
+                            new_rc_type = 1
+                        new_mb_plan.append((start, end, new_rc_type))
                     else:
                         new_mb_plan.append((start, end, rc_type))
-                new_plan.append(new_mb_plan)
-
-
-            return new_plan
+                new_rc_plan.append(new_mb_plan)
+            return new_rc_plan
 
 
         for perm in iterator:
             permuted_minibatch = opt_minibatch.permute_microbatches(perm)
             n_stages = len(permuted_minibatch.microbatches[0].fw_exec_times[0])  # 获取总stage数
             rc_plan = [[(i, i+1, 0) for i in range(n_stages)] for _ in range(len(permuted_minibatch.microbatches))]  # [(start_stage, end_stage, rc_type)] 0表示none
-            opnum = 0
             while True:
-                opnum += 1
-                if opnum > 100:
-                    raise RuntimeError("too many iterations")
+                #print("########################## new iter #####################")
                 # get simulator
                 simulator = get_simulator(
                     sch_type,
@@ -201,10 +214,10 @@ def optimize_schedule(
                 # 检查内存和时间约束
                 if max_device_memory > memory_limit:
                     # 分析每个stage的内存使用情况,修改rc_plan
-                    stage_memories = simulator.get_executor_peak_memory()
-                    new_rc_plan = adjust_rc_plan(rc_plan, stage_memories, memory_limit)
-                    print("new plan generated")
+                    new_rc_plan = adjust_rc_plan(rc_plan, peak_memory, timeline_json, memory_limit)
+                    #print("new plan generated")
                     if new_rc_plan == rc_plan:  # 如果无法进一步优化
+                        #print("no more optimization")
                         break
                     rc_plan = new_rc_plan
                     continue
