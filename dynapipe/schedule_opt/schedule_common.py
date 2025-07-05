@@ -353,7 +353,7 @@ class SchedulerMinibatchSpec:
         # call merge layers on each microbatch
         for microbatch in self.microbatches:
             microbatch._merge_layers(merged2orig)
-            print("microbatch._rc_plan: ", [i[0][2] for i in microbatch._rc_plan])
+            #print("microbatch._rc_plan: ", [i[0][2] for i in microbatch._rc_plan])
         self._layers_merged = True
 
     def _flatten(self):

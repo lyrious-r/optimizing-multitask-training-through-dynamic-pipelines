@@ -56,10 +56,10 @@ def optimize_schedule(
                 # use fw and bw time as features
                 mb_vectors.append(
                     [
-                        mb.fw_exec_times[0],
-                        mb.fw_exec_times[-1],
-                        mb.bw_exec_times[0],
-                        mb.bw_exec_times[-1],
+                        mb.fw_exec_times[0][0],
+                        mb.fw_exec_times[0][-1],
+                        mb.bw_exec_times[0][0],
+                        mb.bw_exec_times[0][-1],
                     ]
                 )
             mb_vectors = np.array(mb_vectors)
@@ -107,7 +107,7 @@ def optimize_schedule(
         max_makespan = 0.0
         max_stats = None
         max_instructions = []
-
+        min_rc_plan = []
         min_makespan = float("inf")
         min_stats = None
         min_instructions = []
@@ -243,7 +243,7 @@ def optimize_schedule(
                     timeline_json,
                 )
                 min_instructions = instructions
-
+                min_rc_plan = rc_plan
                 
         if logger is not None and max_makespan > 0.0:
             logger.debug(
@@ -478,13 +478,13 @@ def construct_minibatch_spec(
             dec_model_output_memory = 0
         # sanity check
         stats = [
-            enc_fw_time,
-            enc_bw_time,
-            dec_fw_time,
-            dec_bw_time,
+            enc_fw_times,
+            enc_bw_times,
+            dec_fw_times,
+            dec_bw_times,
             emb_model_state_memory,
-            enc_stored_activation_memory,
-            dec_stored_activation_memory,
+            enc_stored_activation,
+            dec_stored_activation,
             enc_peak_activation_memory,
             dec_peak_activation_memory,
             enc_model_state_memory,
@@ -504,17 +504,14 @@ def construct_minibatch_spec(
             "dec_model_state_memory",
         ]
         for s, s_name in zip(stats, stats_names):
-            if s is None or math.isnan(s) or math.isinf(s):
-                # for debug purpose:
-                # raise ValueError(
-                #     f"In minibatch {minibatch_idx}, "
-                #     f"microbatch {microbatch_idx} "
-                #     f"({(mbsize, input_seqlen, target_seqlen)}), "
-                #     f"{s_name} is invalid ({s})."
-                # )
-
-                # invalid cost, return None
-                return None
+            def is_invalid(val):
+                return val is None or math.isnan(val) or math.isinf(val)
+            if isinstance(s, (list, tuple)):
+                if any(is_invalid(x) for x in s):
+                    return None
+            else:
+                if is_invalid(s):
+                    return None
 
 
         mb.set_fw_comm_size(
@@ -671,7 +668,7 @@ class ExecutionPlanner:
         )
         best_instrs = None
         best_sch = None
-        best_rc = None
+        best_rc = "none"
         best_cost = None
         best_stats = None
         for schedule_method, minibatch_spec in candidates:
@@ -693,7 +690,6 @@ class ExecutionPlanner:
                 memory_limit=self.device_memory_limit,
                 disable_scheduler_memory_limit=disable_scheduler_memory_limit,
                 raise_on_oom=False,
-                rc_type=rc_type,
                 logger=self.logger,
             )
             if max_makespan < 1e-5:
@@ -709,7 +705,7 @@ class ExecutionPlanner:
             if best_cost is None or min_makespan < best_cost:
                 best_cost = min_makespan
                 best_sch = schedule_method
-                best_rc = rc_type
+                #best_rc = min_rc_plan
                 best_instrs = min_instructions
                 best_stats = min_stats
         if best_instrs is None:
