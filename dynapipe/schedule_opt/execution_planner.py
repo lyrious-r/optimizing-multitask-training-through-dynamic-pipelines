@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import itertools
+import json
 import logging
 import math
+import os
+import time
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -27,6 +30,73 @@ from dynapipe.pipe.utils import validate_device_assignment
 from dynapipe.utils.memory_utils import get_transformer_output_memory
 from dynapipe.schedule_opt.schedule_common import analyze_backward_pass_redundancy
 
+# 性能日志系统
+class PerformanceLogger:
+    def __init__(self, log_dir: str = "./performance_logs"):
+        self.log_dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        self.logger = logging.getLogger("PerformanceLogger")
+        self.logger.setLevel(logging.INFO)
+        
+        # 创建文件处理器
+        log_file = os.path.join(log_dir, "performance.log")
+        handler = logging.FileHandler(log_file)
+        formatter = logging.Formatter(
+            '[%(asctime)s] %(levelname)s: %(message)s'
+        )
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
+        
+        # 创建rc_plan日志文件
+        self.rc_plan_file = os.path.join(log_dir, "rc_plans.json")
+        
+    def log_execution_time(self, function_name: str, execution_time: float, **kwargs):
+        """记录函数执行时间"""
+        log_entry = {
+            "function": function_name,
+            "execution_time": execution_time,
+            "timestamp": time.time(),
+            **kwargs
+        }
+        self.logger.info(f"EXECUTION_TIME: {json.dumps(log_entry)}")
+        
+    def log_rc_plan(self, batch_idx: int, rc_plan: List, **kwargs):
+        """记录rc_plan方案"""
+        log_entry = {
+            "batch_idx": batch_idx,
+            "rc_plan": rc_plan,
+            "timestamp": time.time(),
+            **kwargs
+        }
+        
+        # 读取现有的rc_plan日志
+        existing_logs = []
+        if os.path.exists(self.rc_plan_file):
+            try:
+                with open(self.rc_plan_file, 'r') as f:
+                    existing_logs = json.load(f)
+            except:
+                existing_logs = []
+        
+        # 添加新的日志条目
+        existing_logs.append(log_entry)
+        
+        # 写入文件
+        with open(self.rc_plan_file, 'w') as f:
+            json.dump(existing_logs, f, indent=2)
+
+# 全局性能日志器实例
+_performance_logger = None
+
+def get_performance_logger(log_dir: str = None) -> PerformanceLogger:
+    """获取性能日志器实例"""
+    global _performance_logger
+    if _performance_logger is None:
+        if log_dir is None:
+            log_dir = os.environ.get("DYNAPIPE_PERFORMANCE_LOG_DIR", "./performance_logs")
+        _performance_logger = PerformanceLogger(log_dir)
+    return _performance_logger
+
 def optimize_schedule(
     sch_type: str,
     opt_minibatch: DynaPipeMinibatch,
@@ -44,6 +114,13 @@ def optimize_schedule(
     rc_type: Optional[str] = None, # NOT USED
     logger: Optional[logging.Logger] = None,
 ):
+    # 记录optimize_schedule开始时间
+    perf_logger = get_performance_logger()
+    start_time = time.time()
+    
+    # 添加adjust_rc_plan执行次数计数器
+    adjust_rc_plan_call_count = 0
+    
     if try_permutations:
         if perm_clusters is None:
             if len(opt_minibatch.microbatches) > 20:
@@ -104,6 +181,7 @@ def optimize_schedule(
     permutations.append(list(range(len(opt_minibatch.microbatches))))
 
     def _run_schedules(scheduler_memory_limit):
+        nonlocal adjust_rc_plan_call_count  # 使用外部计数器
         max_makespan = 0.0
         max_stats = None
         max_instructions = []
@@ -128,6 +206,12 @@ def optimize_schedule(
             - 冗余分析结果为空时不做任何调整。
             其它不变。
             """
+            nonlocal adjust_rc_plan_call_count  # 使用外部计数器
+            adjust_rc_plan_call_count += 1  # 增加调用次数
+            
+            # 记录adjust_rc_plan开始时间
+            adjust_start_time = time.time()
+            
             import re
             # 1. 找出超限的 compute executor id
             over_limit_executors = set()
@@ -175,6 +259,18 @@ def optimize_schedule(
                     else:
                         new_mb_plan.append((start, end, rc_type))
                 new_rc_plan.append(new_mb_plan)
+            
+            # 记录adjust_rc_plan执行时间
+            adjust_execution_time = time.time() - adjust_start_time
+            perf_logger.log_execution_time(
+                "adjust_rc_plan", 
+                adjust_execution_time,
+                memory_limit=memory_limit,
+                topk=topk,
+                over_limit_executors_count=len(over_limit_executors),
+                call_count=adjust_rc_plan_call_count  # 记录当前调用次数
+            )
+            
             return new_rc_plan
 
 
@@ -262,6 +358,7 @@ def optimize_schedule(
             min_makespan,
             min_stats,
             min_instructions,
+            min_rc_plan,  # 返回最终的rc_plan
             debug_json,
             mem_for_perms,
         )
@@ -275,6 +372,7 @@ def optimize_schedule(
         min_makespan,
         min_stats,
         min_instructions,
+        min_rc_plan,
         debug_json,
         mem_for_perms,
     ) = _run_schedules(float("inf"))
@@ -293,6 +391,7 @@ def optimize_schedule(
             min_makespan,
             min_stats,
             min_instructions,
+            min_rc_plan,
             debug_json,
             mem_for_perms,
         ) = _run_schedules(memory_limit)
@@ -308,6 +407,18 @@ def optimize_schedule(
             )
         )
 
+    # 记录optimize_schedule执行时间
+    execution_time = time.time() - start_time
+    perf_logger.log_execution_time(
+        "optimize_schedule", 
+        execution_time,
+        sch_type=sch_type,
+        n_microbatches=len(opt_minibatch.microbatches),
+        memory_limit=memory_limit,
+        permutations_count=len(permutations),
+        adjust_rc_plan_call_count=adjust_rc_plan_call_count  # 记录总的adjust_rc_plan调用次数
+    )
+
     return (
         max_makespan,
         max_stats,
@@ -315,6 +426,7 @@ def optimize_schedule(
         min_makespan,
         min_stats,
         min_instructions,
+        min_rc_plan,
     )
 
 
@@ -663,6 +775,10 @@ class ExecutionPlanner:
         disable_scheduler_memory_limit=False,
         current_batch_idx=None,
     ):
+        # 记录generate_execution_plan开始时间
+        perf_logger = get_performance_logger()
+        start_time = time.time()
+        
         candidates = self._create_candidates(
             batch, schedule_method=schedule_method, rc_type=limit_rc_type
         )
@@ -671,6 +787,8 @@ class ExecutionPlanner:
         best_rc = "none"
         best_cost = None
         best_stats = None
+        final_rc_plan = None  # 用于记录最终的rc_plan
+        
         for schedule_method, minibatch_spec in candidates:
             (
                 max_makespan,
@@ -679,6 +797,7 @@ class ExecutionPlanner:
                 min_makespan,
                 min_stats,
                 min_instructions,
+                min_rc_plan,  # 获取返回的rc_plan
             ) = optimize_schedule(
                 schedule_method,
                 minibatch_spec,
@@ -708,6 +827,8 @@ class ExecutionPlanner:
                 #best_rc = min_rc_plan
                 best_instrs = min_instructions
                 best_stats = min_stats
+                final_rc_plan = min_rc_plan  # 使用返回的rc_plan
+        
         if best_instrs is None:
             raise RuntimeError(
                 "No feasible schedule for batch {}.".format(current_batch_idx)
@@ -749,4 +870,27 @@ class ExecutionPlanner:
                 zip(optimized_instrs, n_buffers)
             )
         ]
+        
+        # 记录generate_execution_plan执行时间
+        execution_time = time.time() - start_time
+        perf_logger.log_execution_time(
+            "generate_execution_plan", 
+            execution_time,
+            batch_size=len(batch),
+            current_batch_idx=current_batch_idx,
+            schedule_method=schedule_method,
+            best_cost=best_cost,
+            n_candidates=len(candidates)
+        )
+        
+        # 记录最终的rc_plan方案
+        if final_rc_plan is not None and current_batch_idx is not None:
+            perf_logger.log_rc_plan(
+                current_batch_idx,
+                final_rc_plan,
+                best_cost=best_cost,
+                best_schedule_method=best_sch,
+                batch_size=len(batch)
+            )
+        
         return execution_plans, best_cost, best_stats, best_rc, best_sch
