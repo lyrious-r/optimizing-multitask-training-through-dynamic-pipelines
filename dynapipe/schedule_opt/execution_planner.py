@@ -113,6 +113,7 @@ def optimize_schedule(
     raise_on_oom=True,
     rc_type: Optional[str] = None, # NOT USED
     logger: Optional[logging.Logger] = None,
+    fast_mode=False,  # 新增快速模式参数
 ):
     # 记录optimize_schedule开始时间
     perf_logger = get_performance_logger()
@@ -121,7 +122,7 @@ def optimize_schedule(
     # 添加adjust_rc_plan执行次数计数器
     adjust_rc_plan_call_count = 0
     
-    if try_permutations:
+    if try_permutations:  # 保留排列组合功能
         if perm_clusters is None:
             if len(opt_minibatch.microbatches) > 20:
                 perm_clusters = 3
@@ -199,15 +200,23 @@ def optimize_schedule(
         mem_for_perms = []
 
         def adjust_rc_plan(rc_plan, peak_memory, trace_events, memory_limit, topk=1):
+            # 快速模式下使用更激进的调整策略
+            if fast_mode:
+                topk = min(topk, 2)  # 快速模式下最多调整2个microbatch
             """
             只对 peak_memory 超过 memory_limit 的 compute executor, 调整其冗余最多的 topk 个 microbatch 的 rc_type。
             - 如果 redundancy > 1, new_rc_type 直接设为 1。
             - rc_type == 1 的 microbatch 不参与冗余分析和调整。
             - 冗余分析结果为空时不做任何调整。
+            - 快速模式下减少调整次数。
             其它不变。
             """
             nonlocal adjust_rc_plan_call_count  # 使用外部计数器
             adjust_rc_plan_call_count += 1  # 增加调用次数
+            
+            # 快速模式下限制调整次数
+            if fast_mode and adjust_rc_plan_call_count > 3:  # 最多调整3次
+                return rc_plan
             
             # 记录adjust_rc_plan开始时间
             adjust_start_time = time.time()
@@ -709,6 +718,7 @@ class ExecutionPlanner:
         batch: List[Tuple[int, int, int]],
         schedule_method="dynamic",
         rc_type=None,
+        fast_mode=False,  # 新增快速模式参数
     ):
         # 保持原有的 rc_type 处理逻辑
         if rc_type is not None:
@@ -721,7 +731,16 @@ class ExecutionPlanner:
 
         # 处理调度方法
         if schedule_method == "dynamic":
-            sch_methods = self.valid_schedule_methods
+            if fast_mode:
+                # 快速模式下优先使用 wait-free-cyclic，如果不可用则使用第一个可用的方法
+                if "wait-free-cyclic" in self.valid_schedule_methods:
+                    sch_methods = ["wait-free-cyclic"]
+                elif self.valid_schedule_methods:
+                    sch_methods = [self.valid_schedule_methods[0]]
+                else:
+                    sch_methods = []
+            else:
+                sch_methods = self.valid_schedule_methods
         else:
             if schedule_method not in self.valid_schedule_methods:
                 raise ValueError(
@@ -774,14 +793,17 @@ class ExecutionPlanner:
         disable_permute_microbatches=False,
         disable_scheduler_memory_limit=False,
         current_batch_idx=None,
+        fast_mode=False,  # 新增快速模式参数
     ):
         # 记录generate_execution_plan开始时间
         perf_logger = get_performance_logger()
         start_time = time.time()
         
+        # 快速模式：减少候选方案和排列组合
         candidates = self._create_candidates(
-            batch, schedule_method=schedule_method, rc_type=limit_rc_type
+            batch, schedule_method=schedule_method, rc_type=limit_rc_type, fast_mode=fast_mode
         )
+        
         best_instrs = None
         best_sch = None
         best_rc = "none"
@@ -803,13 +825,14 @@ class ExecutionPlanner:
                 minibatch_spec,
                 self.cluster_spec,
                 self.device_assignment,
-                try_permutations=not disable_permute_microbatches,
+                try_permutations=not disable_permute_microbatches,  # 保留排列组合功能
                 include_memory_stats=True,
                 progress_bar=False,
                 memory_limit=self.device_memory_limit,
                 disable_scheduler_memory_limit=disable_scheduler_memory_limit,
                 raise_on_oom=False,
                 logger=self.logger,
+                fast_mode=fast_mode,  # 传递快速模式参数
             )
             if max_makespan < 1e-5:
                 # no feasible schedule
@@ -880,7 +903,8 @@ class ExecutionPlanner:
             current_batch_idx=current_batch_idx,
             schedule_method=schedule_method,
             best_cost=best_cost,
-            n_candidates=len(candidates)
+            n_candidates=len(candidates),
+            fast_mode=fast_mode  # 记录是否使用快速模式
         )
         
         # 记录最终的rc_plan方案
@@ -890,7 +914,8 @@ class ExecutionPlanner:
                 final_rc_plan,
                 best_cost=best_cost,
                 best_schedule_method=best_sch,
-                batch_size=len(batch)
+                batch_size=len(batch),
+                fast_mode=fast_mode  # 记录是否使用快速模式
             )
         
         return execution_plans, best_cost, best_stats, best_rc, best_sch

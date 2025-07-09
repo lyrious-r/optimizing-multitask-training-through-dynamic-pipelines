@@ -193,6 +193,7 @@ class PreprocessingWorkerData(WorkerData):
     n_layers_per_stage: Optional[int] = None
     assigned_iters_per_node: Optional[int] = None
     node_size: Optional[int] = None
+    fast_mode: Optional[bool] = None  # 新增快速模式字段
 
     def __post_init__(self):
         if self.node_rank is None:
@@ -250,6 +251,7 @@ class KVStoreMetaKeys:
     ASSIGNED_ITER_PER_NODE = "assigned_iters_per_node"
     SEQLEN_OFFSET = "seqlen_offset"
     MODEL_TYPE = "model_type"
+    FAST_MODE = "fast_mode"  # 新增快速模式键
     # used outside dataloader
     N_ITERS = "n_iters"
 
@@ -277,6 +279,7 @@ class TrainingSpec:
     seqlen_offset: int = 0
     limit_rc_type: Optional[List[str]] = None
     model_type: str = "gpt"
+    fast_mode: bool = False  # 新增快速模式参数
     n_executors: int = field(init=False)
     n_layers_per_stage: int = field(init=False)
     n_chunks_per_device: int = field(init=False)
@@ -418,6 +421,14 @@ def _preprocessing_worker_init_fn(worker_id):
     worker_data.disable_scheduler_memory_limit = disable_scheduler_memory_limit
     worker_data.enable_packing = enable_packing
     worker_data.n_layers_per_stage = n_layers_per_stage
+    
+    # 获取快速模式设置
+    fast_mode = kv_store.get(KVStoreMetaKeys.FAST_MODE).decode()
+    if fast_mode.lower() == "true":
+        fast_mode = True
+    else:
+        fast_mode = False
+    worker_data.fast_mode = fast_mode
     # create exec planner
     cluster_spec_json = kv_store.get(KVStoreMetaKeys.CLUSTER_SPEC).decode()
     cluster_spec = DynaPipeCluster.loads(cluster_spec_json)
@@ -622,6 +633,7 @@ def get_preprocessing_collate_fn(
     encoder_key="text_enc",
     decoder_key="text_dec",
     limit_rc_type=None,
+    fast_mode=False,  # 新增快速模式参数
 ):
     def _collate_fn(batch):
         # get states from variables set in worker_init_fn
@@ -672,6 +684,7 @@ def get_preprocessing_collate_fn(
                 worker_data.disable_scheduler_memory_limit
             )
             enable_packing: bool = worker_data.enable_packing
+            fast_mode: bool = worker_data.fast_mode  # 获取快速模式设置
             exec_planner: ExecutionPlanner = worker_data.exec_planner
             # calculate exec plans on planner
             input_seqlens = []
@@ -815,6 +828,7 @@ def get_preprocessing_collate_fn(
                         disable_scheduler_memory_limit=disable_scheduler_memory_limit,  # noqa: E501
                         limit_rc_type=limit_rc_type,
                         current_batch_idx=current_batch_idx,
+                        fast_mode=fast_mode,  # 传递快速模式参数
                     )
                     t_gen_sch_end = time.time()
                     worker_data.logger.debug(
@@ -1263,6 +1277,11 @@ def _preprocessor_poller(
             training_spec.model_type,
             logger=logger,
         )
+        kv_store.set(
+            KVStoreMetaKeys.FAST_MODE,
+            str(training_spec.fast_mode),
+            logger=logger,
+        )
 
         # init all ack keys
         for dp_idx in range(training_spec.data_parallel_size):
@@ -1298,6 +1317,7 @@ def _preprocessor_poller(
             limit_rc_type=training_spec.limit_rc_type,
             encoder_key=encoder_key,
             decoder_key=decoder_key,
+            fast_mode=training_spec.fast_mode,  # 传递快速模式参数
         ),
         False,
         dataloader_args.drop_last,
